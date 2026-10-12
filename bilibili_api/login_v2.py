@@ -15,10 +15,11 @@ import qrcode
 import qrcode_terminal
 import yarl
 from typing import Union, List, Dict
+from urllib.parse import parse_qs, quote, urlsplit
 
 from .utils.utils import get_api, raise_for_statement, to_form_urlencoded
-from .exceptions import LoginError, GeetestException
-from .utils.network import Api, Credential, get_client, get_buvid
+from .exceptions import LoginError, GeetestException, NetworkException
+from .utils.network import Api, Credential, HEADERS, get_client, get_buvid
 from .utils.geetest import Geetest, GeetestType
 from .utils.picture import Picture
 
@@ -487,10 +488,19 @@ class QrCodeLogin:
         """
         if self.__platform == QrCodeLoginChannel.WEB:
             api = API["qrcode"]["web"]["get_events"]
-            params = {"qrcode_key": self.__qr_key}
-            events = (
-                await Api(credential=Credential(), **api).update_params(**params).result
+            # 保留响应中的 Set-Cookie；新版接口不一定在跳转 URL 中携带凭据。
+            response = await get_client().request(
+                method=api["method"],
+                url=api["url"],
+                params={"qrcode_key": self.__qr_key, "source": "main-fe-header"},
+                headers=HEADERS.copy(),
             )
+            if response.code != 200:
+                raise NetworkException(response.code, "获取二维码登录状态失败")
+            result = response.json()
+            if result.get("code") != 0:
+                raise LoginError(f"获取二维码登录状态失败，错误码：{result.get('code')}")
+            events = result["data"]
             code = events["code"]
             if code == 86101:
                 return QrCodeLoginEvents.SCAN
@@ -498,27 +508,35 @@ class QrCodeLogin:
                 return QrCodeLoginEvents.CONF
             elif code == 86038:
                 return QrCodeLoginEvents.TIMEOUT
-            else:
-                cred_url = events["url"]
-                ac_time_value = events["refresh_token"]
-                cookies_list = cred_url.split("?")[1].split("&")
-                sessdata = ""
-                bili_jct = ""
-                dedeuserid = ""
-                for cookie in cookies_list:
-                    if cookie[:8] == "SESSDATA":
-                        sessdata = cookie[9:]
-                    if cookie[:8] == "bili_jct":
-                        bili_jct = cookie[9:]
-                    if cookie[:11].upper() == "DEDEUSERID=":
-                        dedeuserid = cookie[11:]
+            elif code == 0:
+                cookies = {
+                    key.lower(): values[0]
+                    for key, values in parse_qs(
+                        urlsplit(events.get("url", "")).query
+                    ).items()
+                }
+                if "sessdata" in cookies:
+                    cookies["sessdata"] = quote(cookies["sessdata"], safe="")
+                cookies.update(
+                    {
+                        key.lower(): value
+                        for key, value in response.cookies.items()
+                        if value
+                    }
+                )
+                if not cookies.get("sessdata") or not cookies.get("bili_jct"):
+                    raise LoginError("扫码登录响应缺少 SESSDATA 或 bili_jct")
                 self.__credential = Credential(
-                    sessdata=sessdata,
-                    bili_jct=bili_jct,
-                    dedeuserid=dedeuserid,
-                    ac_time_value=ac_time_value,
+                    sessdata=cookies["sessdata"],
+                    bili_jct=cookies["bili_jct"],
+                    dedeuserid=cookies.get("dedeuserid"),
+                    buvid3=cookies.get("buvid3"),
+                    buvid4=cookies.get("buvid4"),
+                    ac_time_value=events.get("refresh_token"),
                 )
                 return QrCodeLoginEvents.DONE
+            else:
+                raise LoginError(f"扫码登录失败，错误码：{code}")
         else:
             api = API["qrcode"]["tv"]["get_events"]
             data = {"auth_code": self.__qr_key, "ts": int(time.time()), "local_id": 0}
